@@ -1,0 +1,128 @@
+"""
+FastAPI service for the Fraudulent Booking Detector.
+
+Endpoints:
+  GET  /health                      - liveness check
+  POST /transactions/generate       - generate & load a synthetic dataset
+  GET  /transactions                - list currently loaded transactions
+  POST /analyze                     - analyze a single transaction (agent)
+  POST /analyze/batch               - analyze all currently loaded transactions
+  POST /analyze/{booking_id}        - analyze one transaction from the loaded set
+
+Run:
+  export LLM_PROVIDER=groq          # or "gemini"
+  export GROQ_API_KEY=gsk_...       # if using groq
+  export GEMINI_API_KEY=AIza...     # if using gemini
+  uvicorn main:app --reload --port 8000
+"""
+from __future__ import annotations
+
+import os
+from typing import Optional
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
+from agent import FraudAgent
+from models import BookingTransaction, FraudVerdict
+from synthetic_data import generate_dataset
+
+load_dotenv()
+
+app = FastAPI(
+    title="Fraudulent Booking Detector",
+    description="LLM agent that investigates travel booking transactions for fraud signals.",
+    version="1.0.0",
+)
+
+# In-memory store standing in for a real bookings database.
+_state: dict = {"dataset": []}
+
+
+def get_agent() -> FraudAgent:
+    provider = os.environ.get("LLM_PROVIDER", "groq").lower()
+    required_key = "GROQ_API_KEY" if provider == "groq" else "GEMINI_API_KEY"
+    if not os.environ.get(required_key):
+        raise HTTPException(
+            status_code=500,
+            detail=f"LLM_PROVIDER is '{provider}' but {required_key} is not set. "
+            f"Export it, or set LLM_PROVIDER to switch providers.",
+        )
+    return FraudAgent(dataset=_state["dataset"], provider=provider)
+
+
+class GenerateRequest(BaseModel):
+    n: int = 200
+    fraud_rate: float = 0.12
+    seed: Optional[int] = 42
+
+
+class BatchAnalyzeRequest(BaseModel):
+    limit: Optional[int] = None  # cap how many of the loaded transactions to analyze
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "loaded_transactions": len(_state["dataset"])}
+
+
+@app.post("/transactions/generate")
+def generate_transactions(req: GenerateRequest):
+    data = generate_dataset(n=req.n, fraud_rate=req.fraud_rate, seed=req.seed)
+    _state["dataset"] = data
+    n_fraud = sum(1 for r in data if r["label"] == "fraud")
+    return {
+        "generated": len(data),
+        "seeded_fraud_count": n_fraud,
+        "seeded_legit_count": len(data) - n_fraud,
+        "note": "The 'label' field is ground truth for evaluation only — it is never shown to the agent.",
+    }
+
+
+@app.get("/transactions")
+def list_transactions(limit: int = 50):
+    return {"count": len(_state["dataset"]), "transactions": _state["dataset"][:limit]}
+
+
+@app.post("/analyze", response_model=FraudVerdict)
+def analyze_transaction(txn: BookingTransaction):
+    agent = get_agent()
+    return agent.analyze(txn)
+
+
+@app.post("/analyze/{booking_id}", response_model=FraudVerdict)
+def analyze_loaded_transaction(booking_id: str):
+    record = next((r for r in _state["dataset"] if r["booking_id"] == booking_id), None)
+    if record is None:
+        raise HTTPException(status_code=404, detail="booking_id not found in loaded dataset")
+    txn = BookingTransaction(**{k: v for k, v in record.items() if k != "label"})
+    agent = get_agent()
+    return agent.analyze(txn)
+
+
+@app.post("/analyze/batch")
+def analyze_batch(req: BatchAnalyzeRequest):
+    agent = get_agent()
+    records = _state["dataset"][: req.limit] if req.limit else _state["dataset"]
+    if not records:
+        raise HTTPException(status_code=400, detail="No transactions loaded. Call /transactions/generate first.")
+
+    results = []
+    for record in records:
+        txn = BookingTransaction(**{k: v for k, v in record.items() if k != "label"})
+        verdict = agent.analyze(txn)
+        results.append({"ground_truth_label": record["label"], "verdict": verdict})
+
+    # Quick evaluation summary against the synthetic ground truth.
+    flagged_risk_levels = {"high", "critical"}
+    tp = sum(1 for r in results if r["ground_truth_label"] == "fraud" and r["verdict"].risk_level in flagged_risk_levels)
+    fn = sum(1 for r in results if r["ground_truth_label"] == "fraud" and r["verdict"].risk_level not in flagged_risk_levels)
+    fp = sum(1 for r in results if r["ground_truth_label"] == "legit" and r["verdict"].risk_level in flagged_risk_levels)
+    tn = sum(1 for r in results if r["ground_truth_label"] == "legit" and r["verdict"].risk_level not in flagged_risk_levels)
+
+    return {
+        "analyzed": len(results),
+        "evaluation": {"true_positives": tp, "false_negatives": fn, "false_positives": fp, "true_negatives": tn},
+        "results": results,
+    }
