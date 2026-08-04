@@ -2,7 +2,8 @@
 FastAPI service for the Fraudulent Booking Detector.
 
 Endpoints:
-  GET  /health                      - liveness check
+  GET  /                             - the web UI (static/index.html)
+  GET  /health                      - liveness + provider status check
   POST /transactions/generate       - generate & load a synthetic dataset
   GET  /transactions                - list currently loaded transactions
   POST /analyze                     - analyze a single transaction (agent)
@@ -18,10 +19,13 @@ Run:
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from agent import FraudAgent
@@ -35,6 +39,9 @@ app = FastAPI(
     description="LLM agent that investigates travel booking transactions for fraud signals.",
     version="1.0.0",
 )
+
+STATIC_DIR = Path(__file__).parent / "static"
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 # In-memory store standing in for a real bookings database.
 _state: dict = {"dataset": []}
@@ -62,9 +69,24 @@ class BatchAnalyzeRequest(BaseModel):
     limit: Optional[int] = None  # cap how many of the loaded transactions to analyze
 
 
+@app.get("/")
+def serve_ui():
+    return FileResponse(STATIC_DIR / "index.html")
+
+
 @app.get("/health")
 def health():
-    return {"status": "ok", "loaded_transactions": len(_state["dataset"])}
+    provider = os.environ.get("LLM_PROVIDER", "groq").lower()
+    required_key = "GROQ_API_KEY" if provider == "groq" else "GEMINI_API_KEY"
+    model = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile") if provider == "groq" \
+        else os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite")
+    return {
+        "status": "ok",
+        "loaded_transactions": len(_state["dataset"]),
+        "provider": provider,
+        "model": model,
+        "provider_configured": bool(os.environ.get(required_key)),
+    }
 
 
 @app.post("/transactions/generate")
