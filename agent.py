@@ -23,7 +23,7 @@ from tools import TOOL_DEFINITIONS, FraudTools
 
 LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "groq").lower()  # "groq" or "gemini"
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite")
 
 SYSTEM_PROMPT = """You are a fraud detection analyst for an online travel booking platform.
 
@@ -237,6 +237,7 @@ class FraudAgent:
             system_instruction=SYSTEM_PROMPT,
             tools=self._gemini_tool_schema(),
             max_output_tokens=1500,
+            thinking_config=types.ThinkingConfig(thinking_budget=0),
         )
         contents = [types.Content(role="user", parts=[types.Part.from_text(text=user_message)])]
         tool_log: list[ToolCallLog] = []
