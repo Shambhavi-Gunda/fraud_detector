@@ -19,6 +19,7 @@ Run:
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -124,21 +125,34 @@ def analyze_batch(req: BatchAnalyzeRequest):
     if not records:
         raise HTTPException(status_code=400, detail="No transactions loaded. Call /transactions/generate first.")
 
+    # Analyze sequentially with a small delay between calls. Each single
+    # analysis can involve several LLM calls (tool-use loop), so free-tier
+    # per-minute rate limits are easy to hit on a batch of many bookings.
+    # A failure on one booking is recorded, not fatal to the whole batch.
     results = []
-    for record in records:
+    for i, record in enumerate(records):
         txn = BookingTransaction(**{k: v for k, v in record.items() if k != "label"})
-        verdict = agent.analyze(txn)
-        results.append({"ground_truth_label": record["label"], "verdict": verdict})
+        try:
+            verdict = agent.analyze(txn)
+            results.append({"ground_truth_label": record["label"], "verdict": verdict, "error": None})
+        except Exception as e:  # noqa: BLE001 - provider SDKs raise different exception types
+            results.append({"ground_truth_label": record["label"], "verdict": None, "error": str(e)})
+        if i < len(records) - 1:
+            time.sleep(3)  # stay under free-tier requests-per-minute limits
 
-    # Quick evaluation summary against the synthetic ground truth.
+    # Quick evaluation summary against the synthetic ground truth (successful analyses only).
     flagged_risk_levels = {"high", "critical"}
-    tp = sum(1 for r in results if r["ground_truth_label"] == "fraud" and r["verdict"].risk_level in flagged_risk_levels)
-    fn = sum(1 for r in results if r["ground_truth_label"] == "fraud" and r["verdict"].risk_level not in flagged_risk_levels)
-    fp = sum(1 for r in results if r["ground_truth_label"] == "legit" and r["verdict"].risk_level in flagged_risk_levels)
-    tn = sum(1 for r in results if r["ground_truth_label"] == "legit" and r["verdict"].risk_level not in flagged_risk_levels)
+    succeeded = [r for r in results if r["verdict"] is not None]
+    failed_count = len(results) - len(succeeded)
+    tp = sum(1 for r in succeeded if r["ground_truth_label"] == "fraud" and r["verdict"].risk_level in flagged_risk_levels)
+    fn = sum(1 for r in succeeded if r["ground_truth_label"] == "fraud" and r["verdict"].risk_level not in flagged_risk_levels)
+    fp = sum(1 for r in succeeded if r["ground_truth_label"] == "legit" and r["verdict"].risk_level in flagged_risk_levels)
+    tn = sum(1 for r in succeeded if r["ground_truth_label"] == "legit" and r["verdict"].risk_level not in flagged_risk_levels)
 
     return {
         "analyzed": len(results),
+        "succeeded": len(succeeded),
+        "failed": failed_count,
         "evaluation": {"true_positives": tp, "false_negatives": fn, "false_positives": fp, "true_negatives": tn},
         "results": results,
     }
