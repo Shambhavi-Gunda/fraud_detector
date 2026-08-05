@@ -113,16 +113,10 @@ def analyze_transaction(txn: BookingTransaction):
     return agent.analyze(txn)
 
 
-@app.post("/analyze/{booking_id}", response_model=FraudVerdict)
-def analyze_loaded_transaction(booking_id: str):
-    record = next((r for r in _state["dataset"] if r["booking_id"] == booking_id), None)
-    if record is None:
-        raise HTTPException(status_code=404, detail="booking_id not found in loaded dataset")
-    txn = BookingTransaction(**{k: v for k, v in record.items() if k != "label"})
-    agent = get_agent()
-    return agent.analyze(txn)
-
-
+# IMPORTANT: /analyze/batch must be defined BEFORE /analyze/{booking_id}.
+# FastAPI matches routes in definition order, so if the dynamic
+# {booking_id} route came first, a request to /analyze/batch would match
+# it instead, treating "batch" as a literal booking_id and 404-ing.
 @app.post("/analyze/batch")
 def analyze_batch(req: BatchAnalyzeRequest):
     agent = get_agent()
@@ -148,3 +142,13 @@ def analyze_batch(req: BatchAnalyzeRequest):
         "evaluation": {"true_positives": tp, "false_negatives": fn, "false_positives": fp, "true_negatives": tn},
         "results": results,
     }
+
+
+@app.post("/analyze/{booking_id}", response_model=FraudVerdict)
+def analyze_loaded_transaction(booking_id: str):
+    record = next((r for r in _state["dataset"] if r["booking_id"] == booking_id), None)
+    if record is None:
+        raise HTTPException(status_code=404, detail="booking_id not found in loaded dataset")
+    txn = BookingTransaction(**{k: v for k, v in record.items() if k != "label"})
+    agent = get_agent()
+    return agent.analyze(txn)
